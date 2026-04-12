@@ -52,7 +52,7 @@ cables.txt               # 4노드 12케이블 예시
 | 2 | card4 | eno7np0 | enp151s0f1np1 |
 | 3 | card6 | eno8np0 | enp220s0f1np1 |
 | 4 | card5 | eno9np0 | enp185s0f1np1 |
-| 5 | card0 | eno10np0 * | enp23s0f1np1 |
+| 5 | card0 | eno10np0  | enp23s0f1np1 |
 | 6 | card3 | eno11np0 | enp112s0f1np1 |
 | 7 | card1 | eno12np0 | enp57s0f1np1 |
 | 8 | card2 | eno13np0 | enp95s0f1np1 |
