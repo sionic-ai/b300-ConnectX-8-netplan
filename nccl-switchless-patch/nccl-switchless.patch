@@ -1,0 +1,202 @@
+diff --git a/src/transport/net_ib/common.h b/src/transport/net_ib/common.h
+index bed9ea6..cb4a598 100644
+--- a/src/transport/net_ib/common.h
++++ b/src/transport/net_ib/common.h
+@@ -553,7 +553,7 @@ ncclResult_t ncclIbPeerMemSupport();
+ ncclResult_t ncclIbDmaBufSupport(int dev);
+
+ void ncclIbAddEvent(struct ncclIbRequest* req, int devIndex);
+-ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex);
++ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex, union ibv_gid* remoteGid = NULL);
+ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbRequest** req);
+ ncclResult_t ncclIbFreeRequest(struct ncclIbRequest* r);
+
+diff --git a/src/transport/net_ib/connect.cc b/src/transport/net_ib/connect.cc
+index 8c61b67..fe94e7d 100644
+--- a/src/transport/net_ib/connect.cc
++++ b/src/transport/net_ib/connect.cc
+@@ -11,6 +11,7 @@
+
+ NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -1);
+ NCCL_PARAM(IbRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
++NCCL_PARAM(IbSwitchlessEnable, "IB_SWITCHLESS", 0);
+ NCCL_PARAM(IbRoceVersionNum, "IB_ROCE_VERSION_NUM", 2);
+ NCCL_PARAM(IbTimeout, "IB_TIMEOUT", 20);
+ NCCL_PARAM(IbRetryCnt, "IB_RETRY_CNT", 7);
+@@ -284,7 +285,86 @@ static ncclResult_t ncclUpdateGidIndex(struct ibv_context* context, uint8_t port
+   return ncclSuccess;
+ }
+
+-ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex) {
++/*
++ * Switchless direct-connect GID selection (NCCL_IB_SWITCHLESS=1).
++ *
++ * In a switchless topology each node pair has its own isolated /30 subnet.
++ * Standard NCCL picks a GID based on local preferences only, ignoring
++ * which remote peer it will talk to.  This causes QP setup to fail when
++ * the selected GID is on a subnet unreachable by the remote.
++ *
++ * When enabled, we extract the IPv4 embedded in the remote GID and scan
++ * the local GID table for a matching subnet.  This ensures local/remote
++ * GIDs sit on the same point-to-point link.
++ */
++static uint32_t gidToIpv4(union ibv_gid* gid) {
++  /* RoCE v2 GIDs embed IPv4 as ::ffff:a.b.c.d -> bytes [12..15] */
++  const struct in6_addr *a = (struct in6_addr *)gid->raw;
++  return ntohl(a->s6_addr32[3]);
++}
++
++static bool sameSubnet(uint32_t ip1, uint32_t ip2, int prefixBits) {
++  if (prefixBits == 0) return true;
++  uint32_t mask = 0xFFFFFFFF << (32 - prefixBits);
++  return (ip1 & mask) == (ip2 & mask);
++}
++
++static ncclResult_t ncclIbGetGidIndexForPeer(
++    struct ibv_context *context, uint8_t portNum,
++    struct ibv_port_attr* portAttr, union ibv_gid* remoteGid,
++    int *gidIndex)
++{
++  *gidIndex = -1;
++  int gidTblLen = portAttr->gid_tbl_len;
++  uint32_t remoteIp = gidToIpv4(remoteGid);
++
++  /* Default /16 prefix match covers 10.XY.*.* scheme; override via env */
++  int prefixBits = 16;
++  const char* prefixEnv = ncclGetEnv("NCCL_IB_SWITCHLESS_PREFIX");
++  if (prefixEnv && strlen(prefixEnv) > 0) {
++    prefixBits = atoi(prefixEnv);
++    if (prefixBits < 8 || prefixBits > 30) prefixBits = 16;
++  }
++
++  int userRoceVersion = ncclParamIbRoceVersionNum();
++
++  INFO(NCCL_NET, "NET/IB: Switchless GID select: remote %u.%u.%u.%u /%d, scanning %d GIDs",
++       (remoteIp >> 24) & 0xff, (remoteIp >> 16) & 0xff,
++       (remoteIp >> 8) & 0xff, remoteIp & 0xff,
++       prefixBits, gidTblLen);
++
++  for (int i = 0; i < gidTblLen; i++) {
++    union ibv_gid localGid;
++    NCCLCHECK(wrap_ibv_query_gid(context, portNum, i, &localGid));
++    if (!validGid(&localGid)) continue;
++    if (getGidAddrFamily(&localGid) != AF_INET) continue;
++
++    /* Check RoCE version */
++    int roceVer = -1;
++    const char* deviceName = wrap_ibv_get_device_name(context->device);
++    NCCLCHECK(ncclIbRoceGetVersionNum(deviceName, portNum, i, &roceVer));
++    if (roceVer != userRoceVersion) continue;
++
++    uint32_t localIp = gidToIpv4(&localGid);
++    if (sameSubnet(localIp, remoteIp, prefixBits)) {
++      *gidIndex = i;
++      INFO(NCCL_NET, "NET/IB: Switchless matched GID[%d] local %u.%u.%u.%u <-> remote %u.%u.%u.%u",
++           i,
++           (localIp >> 24) & 0xff, (localIp >> 16) & 0xff,
++           (localIp >> 8) & 0xff, localIp & 0xff,
++           (remoteIp >> 24) & 0xff, (remoteIp >> 16) & 0xff,
++           (remoteIp >> 8) & 0xff, remoteIp & 0xff);
++      return ncclSuccess;
++    }
++  }
++
++  INFO(NCCL_NET, "NET/IB: Switchless: no match for remote %u.%u.%u.%u /%d, falling back",
++       (remoteIp >> 24) & 0xff, (remoteIp >> 16) & 0xff,
++       (remoteIp >> 8) & 0xff, remoteIp & 0xff, prefixBits);
++  return ncclSuccess;
++}
++
++ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex, union ibv_gid* remoteGid) {
+   int gidTblLen = portAttr->gid_tbl_len;
+
+   //for IB, choose GID Index that will have routable FLID if present
+@@ -303,6 +383,17 @@ ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, str
+   }
+
+   //for ROCE
++  // --- Switchless patch: subnet-aware GID selection ---
++  if (ncclParamIbSwitchlessEnable() && remoteGid != NULL) {
++    int peerGidIndex = -1;
++    NCCLCHECK(ncclIbGetGidIndexForPeer(context, portNum, portAttr, remoteGid, &peerGidIndex));
++    if (peerGidIndex >= 0) {
++      *gidIndex = peerGidIndex;
++      return ncclSuccess;
++    }
++    INFO(NCCL_NET, "NET/IB: Switchless: no peer-matched GID found, falling back to default");
++  }
++
+   *gidIndex = ncclParamIbGidIndex();
+   if (*gidIndex >= 0) {
+     return ncclSuccess;
+@@ -865,6 +956,26 @@ ib_connect:
+     comm->base.remDevs[i].remoteGid.global.subnet_prefix = comm->base.remDevs[i].gid.global.subnet_prefix;
+   }
+
++  // --- Switchless patch: re-select local GID to match remote peer's subnet ---
++  if (ncclParamIbSwitchlessEnable()) {
++    for (int i = 0; i < comm->base.vProps.ndevs; i++) {
++      ncclIbSendCommDev* commDev = comm->devs + i;
++      ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
++      int remIdx = i % remMeta.ndevs;
++      union ibv_gid peerGid;
++      peerGid.global.subnet_prefix = remMeta.devs[remIdx].gid.global.subnet_prefix;
++      peerGid.global.interface_id  = remMeta.devs[remIdx].gid.global.interface_id;
++
++      int newGidIndex = -1;
++      NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &newGidIndex, &peerGid), ret, fail);
++      if (newGidIndex >= 0) {
++        commDev->base.gidInfo.localGidIndex = newGidIndex;
++        NCCLCHECKGOTO(wrap_ibv_query_gid(ibDev->context, ibDev->portNum, newGidIndex, &commDev->base.gidInfo.localGid), ret, fail);
++        INFO(NCCL_NET, "NET/IB: Switchless sender re-selected GID[%d] for dev %d", newGidIndex, i);
++      }
++    }
++  }
++
+   // Store the completion records info provided by the remote
+   comm->remCmplsRecords.addr = remMeta.addr;
+   for (int i = 0; i < comm->base.nRemDevs; i++) {
+@@ -1289,7 +1400,16 @@ ib_recv:
+       NCCLCHECKGOTO(ncclIbResiliencyDevInit(rComm->base.resiliency, i, &ncclIbDevs[ibDevN]), ret, fail);
+     }
+     ibDev = ncclIbDevs + ibDevN;
+-    NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &rCommDev->base.gidInfo.localGidIndex), ret, fail);
++    // --- Switchless patch: receiver uses sender's GID for subnet-aware selection ---
++    if (ncclParamIbSwitchlessEnable() && i < remMeta.ndevs) {
++      union ibv_gid peerGid;
++      peerGid.global.subnet_prefix = remMeta.devs[i].gid.global.subnet_prefix;
++      peerGid.global.interface_id  = remMeta.devs[i].gid.global.interface_id;
++      NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &rCommDev->base.gidInfo.localGidIndex, &peerGid), ret, fail);
++      INFO(NCCL_NET, "NET/IB: Switchless receiver selected GID[%d] for dev %d", rCommDev->base.gidInfo.localGidIndex, i);
++    } else {
++      NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &rCommDev->base.gidInfo.localGidIndex), ret, fail);
++    }
+     NCCLCHECKGOTO(wrap_ibv_query_gid(ibDev->context, ibDev->portNum, rCommDev->base.gidInfo.localGidIndex, &rCommDev->base.gidInfo.localGid), ret, fail);
+     if (link_layer == IBV_LINK_LAYER_UNSPECIFIED) link_layer = ibDev->portAttr.link_layer;
+     if (link_layer != ibDev->portAttr.link_layer) {
+diff --git a/src/transport/net_ib/gdaki/gin_host_gdaki.cc b/src/transport/net_ib/gdaki/gin_host_gdaki.cc
+index ed95662..c4ec200 100644
+--- a/src/transport/net_ib/gdaki/gin_host_gdaki.cc
++++ b/src/transport/net_ib/gdaki/gin_host_gdaki.cc
+@@ -578,7 +578,7 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
+                 status, out);
+
+   // Get the GID index
+-  NCCLCHECKGOTO(cComm->getGidIndex(cComm->ib.context, gdaki_ctx->port_num, &gdaki_ctx->port_attr, &ib_gid_index), status, out);
++  NCCLCHECKGOTO(cComm->getGidIndex(cComm->ib.context, gdaki_ctx->port_num, &gdaki_ctx->port_attr, &ib_gid_index, NULL), status, out);
+   gdaki_ctx->gid_index = ib_gid_index;
+
+   NCCLCHECKGOTO(wrap_ibv_query_gid(cComm->ib.context, 1, ib_gid_index, &gdaki_ctx->rgid), status,
+diff --git a/src/transport/net_ib/gin.h b/src/transport/net_ib/gin.h
+index 7b8e03e..8155dc7 100644
+--- a/src/transport/net_ib/gin.h
++++ b/src/transport/net_ib/gin.h
+@@ -26,7 +26,7 @@ struct ncclGinIbCollComm {
+   ncclResult_t (*getProperties)(int dev, void *props);
+   ncclResult_t (*allGather)(struct ncclGinIbCollComm *cComm, void *srcBuf, void *recvBuf, size_t len);
+   ncclResult_t (*allToAll)(struct ncclGinIbCollComm *cComm, void *srcBuf, void *recvBuf, size_t len);
+-  ncclResult_t (*getGidIndex)(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex);
++  ncclResult_t (*getGidIndex)(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex, union ibv_gid* remoteGid);
+ };
+
+ #endif
